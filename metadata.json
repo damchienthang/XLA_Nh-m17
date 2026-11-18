@@ -1,0 +1,6 @@
+{
+  "name": "CO-SPY Forensic Studio",
+  "description": "Multi-domain AI-generated image forensic analyzer comparing Baseline CO-SPY against Enhanced 2D-FFT, RGB Chrominance Correlation, and Quality-Aware CAGU Fusion.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
