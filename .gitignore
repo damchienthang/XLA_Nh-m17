@@ -7,3 +7,5 @@ coverage/
 .env*
 !.env.example
 .playwright-cli/
+__pycache__/
+*.pyc
