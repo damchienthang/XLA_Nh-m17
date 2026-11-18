@@ -1,0 +1,13 @@
+numpy>=1.24.0
+pillow>=10.0.0
+opencv-python-headless>=4.8.0
+streamlit>=1.32.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+# Optional neural backbone dependencies (if running full CO-SPY VAE + SigLIP-384 checkpoints):
+torch>=2.1.0
+torchvision>=0.16.0
+diffusers>=0.25.0
+transformers>=4.36.0
+open-clip-torch>=2.24.0
+timm>=0.9.12

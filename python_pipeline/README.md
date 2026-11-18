@@ -1,32 +1,32 @@
-# CO-SPY Python Pipeline — Bản Vá Đã Sửa Lỗi (v2)
+# CO-SPY Forensic Studio — Full Python Project (`python_pipeline/`)
 
-Thư mục `python_pipeline/` chứa các module Python đã được sửa hoàn chỉnh để thay thế trực tiếp vào repo gốc `AI-FORENSIC-STUDIO-CO-SPY-BASELINE-vs-ENHANCED`.
+Toàn bộ dự án **CO-SPY Forensic Studio** đã được viết hoàn chỉnh bằng Python (gồm cả engine suy luận lai PyTorch/NumPy, giao diện Streamlit 3 tab, công cụ CLI, XAI Grad-CAM và script train/benchmark).
 
-## Các lỗi gốc đã được xử lý triệt để
-1. **`frequency_branch.py` — Xóa bỏ hiện tượng mất biên độ phổ & mờ cao tần**:
-   - Bỏ chuẩn hóa `min-max` từng ảnh về `[0, 1]` trong `HighPassFFTLayer` (nguyên nhân khiến `FreqE` của ảnh thật `0.485` và AI `0.501` trùng khít nhau); thay bằng `log1p(|F|)` + `BatchNorm2d` toàn cục.
-   - Chạy 2D-FFT trên patch **độ phân giải gốc (native crop)** thay vì resize bilinear `256×256` làm mất sạch dấu vết của ảnh FLUX `1024×1024`.
-2. **`native_forensics.py` — Bổ sung bộ trích xuất đa miền đã kiểm chuẩn (`96.55%–100%` trên 29 ảnh)**:
-   - Đo `Chroma / Luma`, `min(corr(R,G), corr(G,B))` (bắt hiệu ứng khóa kênh latent space của AI, đồng thời bảo vệ ảnh quang học xóa phông nông như `real_photo_flower.jpg`).
-   - Đo `JPEG Blockiness (8×8)`, `Smooth-Region Shot Noise`, `Laplacian Kurtosis` và trung hòa nhánh sắc độ khi ảnh đơn sắc (`saturation_mean < 0.09`).
-3. **`adaptive_fusion.py` — CAGU nhận tín hiệu chất lượng nén thực tế**:
-   - Truyền trực tiếp vector side-information `[jpeg_blockiness, saturation_mean, chroma_to_luma, min_channel_corr]` vào mạng gating `CAGU`, tránh kẹt ở tỷ lệ `50.2% / 49.8%`.
-4. **`engine.py` — Tương thích 100% với `app.py`**:
-   - Nạp thêm `End2EndDetector` (`Semantic SigLIP-384 + VAE`) khi có `end2end_weights.pth` (fallback mượt về `ArtifactDetector`).
-   - Loại bỏ hoàn toàn các ngưỡng gây sai số hàng loạt cũ (`f_ratio > 0.23`, `mse < 0.0008`, `f_spikes > 100` trong `_build_analysis_log`).
-5. **`train_head.py` — Train nhanh head bằng Feature Caching**:
-   - Đóng băng CLIP/VAE để trích sẵn vector đặc trưng kèm JPEG (`q=30..95`) + Resize augmentation, giúp train `EnhancedCoSpyHead` trong vài giây thay vì `41s/ảnh`.
+## Cấu trúc mã nguồn Python
+- `native_forensics.py`: Bộ phân tích tín hiệu vật lý đa miền ở độ phân giải gốc (`Native 2D-FFT`, `Chroma/Luma`, `min RGB corr`, `Smooth Noise`, `Laplacian Kurtosis`, `JPEG 8×8 Blockiness` và van điều tiết CAGU).
+- `frequency_branch.py`: Mạng `HighPassFFTLayer` + `FrequencyBranch` giữ nguyên biên độ phổ `log1p(|F|)` trên crop độ phân giải gốc (không chuẩn hóa min-max per-sample).
+- `adaptive_fusion.py`: `CAGU` điều kiện hóa theo chất lượng nén + `DualDomainConsistency` + `EnhancedCoSpyHead`.
+- `engine.py`: `CoSpyEngine` hỗ trợ cả chế độ PyTorch (`End2EndDetector` SigLIP-384 + VAE + `EnhancedCoSpyHead`) lẫn chế độ nhẹ CPU thuần NumPy/OpenCV, kèm đối chiếu trực tiếp Baseline v1 vs Enhanced v2.
+- `gradcam.py`: `GradCAMExplainer` (PyTorch ResNet hook) và `NativeAnomalyLocalizer` (CPU gradient-free).
+- `app.py`: Giao diện web Streamlit đầy đủ 3 tab (`Bàn Khám Nghiệm`, `Benchmark Thực Nghiệm`, `Chẩn Đoán Pipeline`).
+- `cli.py`: Công cụ dòng lệnh kiểm tra 1 ảnh hoặc chạy benchmark toàn bộ `manifest.csv`.
+- `train_head.py`: Script đóng băng CLIP/VAE, cache feature và train `FrequencyBranch` + `EnhancedCoSpyHead` kèm augmentation JPEG (`q=30..95`) & Resize.
+- `requirements.txt`: Danh sách thư viện cài đặt.
 
-## Cách áp dụng vào repo Python trên máy bạn
-Copy toàn bộ 5 file `.py` trong `python_pipeline/` đè vào thư mục gốc của repo `AI-FORENSIC-STUDIO-CO-SPY-BASELINE-vs-ENHANCED/`:
-
+## Cách chạy trên máy cá nhân
 ```bash
-# 1. Đánh giá trực tiếp trên 27 ảnh trong test_images/manifest.csv
-python train_head.py --eval-only --manifest test_images/manifest.csv
+cd python_pipeline
+pip install -r requirements.txt
 
-# 2. (Tùy chọn) Train thêm head PyTorch với tập ảnh train real/ và fake/ của riêng bạn
-python train_head.py --data-dir ./dataset_train --epochs 25 --out pretrained/enhanced_head.pth
-
-# 3. Chạy lại giao diện Streamlit
+# 1. Chạy giao diện Streamlit (tự động đọc ảnh mẫu tại ../public/dataset/ nếu chạy trong repo này, hoặc ./test_images/)
 streamlit run app.py
+
+# 2. Hoặc chạy benchmark nhanh bằng CLI (không cần GPU)
+python cli.py --benchmark --manifest ../public/dataset/manifest.csv
+
+# 3. Kiểm tra 1 ảnh cụ thể
+python cli.py --image ../public/dataset/degraded/degraded_04.jpg
+
+# 4. (Tùy chọn) Train head PyTorch nếu có tập ảnh real/ và fake/ riêng
+python train_head.py --data-dir path/to/train_data --epochs 25 --out pretrained/enhanced_head.pth
 ```
