@@ -32,6 +32,9 @@ export interface ForensicFeatures {
   corrRG: number;
   corrGB: number;
   smoothNoise: number;
+  nzSmoothNoise: number;
+  zeroGradPct: number;
+  sharpEdgePct: number;
   lapKurtosis: number;
   patchAnomalyCoveragePct: number;
 }
@@ -189,6 +192,10 @@ export function analyzeImagePixels(
   let lapCount = 0;
   let smoothSq = 0;
   let smoothCount = 0;
+  let nzSmoothSq = 0;
+  let nzSmoothCount = 0;
+  let zeroGradCount = 0;
+  let sharpEdgeCount = 0;
 
   // Spatial VAE-proxy residual MSE (3x3 Gaussian blur reconstruction diff on [0,1])
   let blurReconMse = 0;
@@ -248,9 +255,16 @@ export function analyzeImagePixels(
 
       const gx = Math.abs(rgba[pR + 1] - rgba[pL + 1]);
       const gy = Math.abs(rgba[pD + 1] - rgba[pU + 1]);
-      if (gx + gy < 12) {
+      const gMag = gx + gy;
+      if (gMag < 2) zeroGradCount++;
+      if (gMag > 120) sharpEdgeCount++;
+      if (gMag < 12) {
         smoothSq += luma * luma;
         smoothCount++;
+        if (gMag >= 2) {
+          nzSmoothSq += luma * luma;
+          nzSmoothCount++;
+        }
       }
     }
   }
@@ -262,82 +276,118 @@ export function analyzeImagePixels(
   const lapMeanSq = lapSq / Math.max(lapCount, 1);
   const lapKurtosis = lapFourth / Math.max(lapCount, 1) / (lapMeanSq * lapMeanSq + 1e-9);
   const smoothNoise = smoothCount > 0 ? Math.sqrt(smoothSq / smoothCount) : 0;
+  const nzSmoothNoise = nzSmoothCount > 0 ? Math.sqrt(nzSmoothSq / nzSmoothCount) : smoothNoise;
+  const zeroGradPct = (zeroGradCount / Math.max(lapCount, 1)) * 100;
+  const sharpEdgePct = (sharpEdgeCount / Math.max(lapCount, 1)) * 100;
   const spatialResidualMse = blurReconMse / Math.max(lapCount, 1);
 
-  // 3. Native-crop denoised residual 2D-FFT (no bilinear downsampling!)
+  // 3. Multi-crop native denoised residual 2D-FFT (excluding DC axis cross & 8x8 JPEG grid harmonics)
   const maxPow2 = Math.pow(2, Math.floor(Math.log2(Math.min(width, height))));
   const nativeFftSize = Math.max(64, Math.min(128, maxPow2));
-  const ox = Math.floor((width - nativeFftSize) / 2);
-  const oy = Math.floor((height - nativeFftSize) / 2);
-  const patchRes = new Float64Array(nativeFftSize * nativeFftSize);
-
-  for (let py = 0; py < nativeFftSize; py++) {
-    const gy = oy + py;
-    for (let px = 0; px < nativeFftSize; px++) {
-      const gx = ox + px;
-      if (gx > 0 && gx < width - 1 && gy > 0 && gy < height - 1) {
-        const c = gray[gy * width + gx];
-        const avg4 =
-          0.25 *
-          (gray[gy * width + gx - 1] +
-            gray[gy * width + gx + 1] +
-            gray[(gy - 1) * width + gx] +
-            gray[(gy + 1) * width + gx]);
-        patchRes[py * nativeFftSize + px] = c - avg4;
-      }
-    }
-  }
-
-  const nativeMag = computeFft2dMagnitude(patchRes, nativeFftSize);
   const half = nativeFftSize >> 1;
-  let eLow = 0;
-  let cLow = 0;
-  let eMid = 0;
-  let cMid = 0;
-  let eHigh = 0;
-  let cHigh = 0;
-  const highVals: number[] = [];
-  const nativeLog = new Float64Array(nativeFftSize * nativeFftSize);
-  let nMinLog = Infinity;
-  let nMaxLog = -Infinity;
+  const step8 = nativeFftSize / 8;
+  const cropCoords: [number, number][] = [
+    [Math.floor((width - nativeFftSize) / 2), Math.floor((height - nativeFftSize) / 2)],
+    [Math.floor((width - nativeFftSize) * 0.18), Math.floor((height - nativeFftSize) * 0.25)],
+    [Math.floor((width - nativeFftSize) * 0.82), Math.floor((height - nativeFftSize) * 0.25)],
+    [Math.floor((width - nativeFftSize) * 0.18), Math.floor((height - nativeFftSize) * 0.75)],
+    [Math.floor((width - nativeFftSize) * 0.82), Math.floor((height - nativeFftSize) * 0.75)],
+  ];
 
-  for (let y = 0; y < nativeFftSize; y++) {
-    for (let x = 0; x < nativeFftSize; x++) {
-      const idx = y * nativeFftSize + x;
-      const v = nativeMag[idx];
-      const lm = Math.log(v + 1e-6);
-      nativeLog[idx] = lm;
-      if (lm < nMinLog) nMinLog = lm;
-      if (lm > nMaxLog) nMaxLog = lm;
+  const patchRes = new Float64Array(nativeFftSize * nativeFftSize);
+  const hmList: number[] = [];
+  const mlList: number[] = [];
+  const pkList: number[] = [];
+  let centerFftLogMag = new Uint8Array(nativeFftSize * nativeFftSize);
 
-      const r = Math.hypot(x - half, y - half);
-      const rNorm = r / half; // 0..1.41
-      if (rNorm >= 0.06 && rNorm < 0.25) {
-        eLow += v;
-        cLow++;
-      } else if (rNorm >= 0.25 && rNorm < 0.625) {
-        eMid += v;
-        cMid++;
-      } else if (rNorm >= 0.625 && rNorm <= 1.0) {
-        eHigh += v;
-        cHigh++;
-        highVals.push(v);
+  for (let cIdx = 0; cIdx < cropCoords.length; cIdx++) {
+    const [ox, oy] = cropCoords[cIdx];
+    patchRes.fill(0);
+    for (let py = 0; py < nativeFftSize; py++) {
+      const gy = oy + py;
+      for (let px = 0; px < nativeFftSize; px++) {
+        const gx = ox + px;
+        if (gx > 0 && gx < width - 1 && gy > 0 && gy < height - 1) {
+          const c = gray[gy * width + gx];
+          const avg4 =
+            0.25 *
+            (gray[gy * width + gx - 1] +
+              gray[gy * width + gx + 1] +
+              gray[(gy - 1) * width + gx] +
+              gray[(gy + 1) * width + gx]);
+          patchRes[py * nativeFftSize + px] = c - avg4;
+        }
+      }
+    }
+
+    const mag = computeFft2dMagnitude(patchRes, nativeFftSize);
+    let eLow = 0;
+    let cLow = 0;
+    let eMid = 0;
+    let cMid = 0;
+    let eHigh = 0;
+    let cHigh = 0;
+    const highVals: number[] = [];
+
+    for (let y = 0; y < nativeFftSize; y++) {
+      for (let x = 0; x < nativeFftSize; x++) {
+        const dx = Math.abs(x - half);
+        const dy = Math.abs(y - half);
+        if (dx <= 2 || dy <= 2) continue; // Exclude horizontal/vertical DC & border axes
+        const rNorm = Math.hypot(dx, dy) / half;
+        const v = mag[y * nativeFftSize + x];
+        if (rNorm >= 0.06 && rNorm < 0.25) {
+          eLow += v;
+          cLow++;
+        } else if (rNorm >= 0.25 && rNorm < 0.625) {
+          eMid += v;
+          cMid++;
+        } else if (rNorm >= 0.625 && rNorm <= 1.0) {
+          eHigh += v;
+          cHigh++;
+          const onJpegHarmonic =
+            (dx % step8 <= 1 || step8 - (dx % step8) <= 1) &&
+            (dy % step8 <= 1 || step8 - (dy % step8) <= 1);
+          if (!onJpegHarmonic) {
+            highVals.push(v);
+          }
+        }
+      }
+    }
+
+    highVals.sort((a, b) => a - b);
+    const highMed = highVals[Math.floor(highVals.length / 2)] || 1;
+    const highP99 = highVals[Math.floor(highVals.length * 0.99)] || 1;
+    pkList.push(highP99 / (highMed + 1e-6));
+    mlList.push((eMid / Math.max(cMid, 1)) / (eLow / Math.max(cLow, 1) + 1e-6));
+    hmList.push((eHigh / Math.max(cHigh, 1)) / (eMid / Math.max(cMid, 1) + 1e-6));
+
+    if (cIdx === 0) {
+      const nativeLog = new Float64Array(nativeFftSize * nativeFftSize);
+      let nMinLog = Infinity;
+      let nMaxLog = -Infinity;
+      for (let i = 0; i < nativeFftSize * nativeFftSize; i++) {
+        const lm = Math.log(mag[i] + 1e-6);
+        nativeLog[i] = lm;
+        if (lm < nMinLog) nMinLog = lm;
+        if (lm > nMaxLog) nMaxLog = lm;
+      }
+      const nSpan = nMaxLog - nMinLog + 1e-6;
+      centerFftLogMag = new Uint8Array(nativeFftSize * nativeFftSize);
+      for (let i = 0; i < nativeFftSize * nativeFftSize; i++) {
+        centerFftLogMag[i] = Math.max(0, Math.min(255, Math.round(((nativeLog[i] - nMinLog) / nSpan) * 255)));
       }
     }
   }
 
-  highVals.sort((a, b) => a - b);
-  const highMed = highVals[Math.floor(highVals.length / 2)] || 1;
-  const highP99 = highVals[Math.floor(highVals.length * 0.99)] || 1;
-  const nativePeakMedRatio = highP99 / (highMed + 1e-6);
-  const nativeMidLowRatio = (eMid / Math.max(cMid, 1)) / (eLow / Math.max(cLow, 1) + 1e-6);
-  const nativeHighMidRatio = (eHigh / Math.max(cHigh, 1)) / (eMid / Math.max(cMid, 1) + 1e-6);
-
-  const nativeFftLogMag = new Uint8Array(nativeFftSize * nativeFftSize);
-  const nSpan = nMaxLog - nMinLog + 1e-6;
-  for (let i = 0; i < nativeFftSize * nativeFftSize; i++) {
-    nativeFftLogMag[i] = Math.max(0, Math.min(255, Math.round(((nativeLog[i] - nMinLog) / nSpan) * 255)));
-  }
+  hmList.sort((a, b) => a - b);
+  mlList.sort((a, b) => a - b);
+  pkList.sort((a, b) => a - b);
+  const nativeHighMidRatio = hmList[2];
+  const nativeMidLowRatio = mlList[2];
+  const nativePeakMedMed = pkList[2];
+  const nativePeakMedP75 = pkList[3];
+  const nativeFftLogMag = centerFftLogMag;
 
   // 4. Visualization buffers (256x256 downsampled residual & patch-level spatial Grad-CAM proxy)
   const visWidth = 256;
@@ -445,44 +495,68 @@ export function analyzeImagePixels(
   const compressionMode: CaguWeights['compressionMode'] =
     jpegBlockiness > 1.22 ? 'heavy_jpeg' : jpegBlockiness > 1.08 ? 'moderate_jpeg' : 'uncompressed';
   const isMonoOrLowSat = saturationMean < 0.09;
+  const isGraphicComposite = zeroGradPct > 25 && sharpEdgePct > 3.5 && saturationMean > 0.25;
+  const isSmallThumbnail = Math.min(width, height) < 360 && compressionMode === 'uncompressed';
+  const nativePeakMedRatio = compressionMode === 'heavy_jpeg' ? nativePeakMedMed : nativePeakMedP75;
 
-  // Branch A: Native Spectral Branch (high/mid roll-off + periodic peak-to-median)
-  // On uncompressed images, real photos maintain hi/mid ~1.18-1.38 whereas SD/diffusion drops ~0.63-1.01
-  const spectralRolloffAnom = sigmoid((1.09 - nativeHighMidRatio) * 6.0);
-  const spectralPeakAnom = sigmoid((nativePeakMedRatio - 4.35) * 1.1);
-  const freqScore =
-    compressionMode === 'heavy_jpeg'
-      ? clamp01(0.65 * spectralPeakAnom + 0.35 * sigmoid((1.55 - nativeMidLowRatio) * 2.5))
-      : clamp01(0.65 * spectralRolloffAnom + 0.35 * spectralPeakAnom);
+  // Branch A: Native Multi-Crop Spectral Branch
+  const rolloffPivot = isSmallThumbnail ? 0.62 : 1.07;
+  const spectralRolloffAnom = sigmoid((rolloffPivot - nativeHighMidRatio) * 6.0);
+  const spectralPeakAnom = sigmoid((nativePeakMedRatio - 4.45) * 1.15);
+  let freqScore: number;
+  if (compressionMode === 'heavy_jpeg') {
+    const midLowAnom = sigmoid((1.48 - nativeMidLowRatio) * 2.8);
+    const heavyHiMidAnom = sigmoid((0.76 - nativeHighMidRatio) * 5.0);
+    freqScore = isGraphicComposite
+      ? clamp01(
+          0.45 * sigmoid((0.92 - nativeHighMidRatio) * 6.0) +
+            0.35 * sigmoid((1.55 - nativeMidLowRatio) * 3.0) +
+            0.20 * sigmoid((nativePeakMedP75 - 4.2) * 1.1)
+        )
+      : clamp01(0.45 * spectralPeakAnom + 0.35 * midLowAnom + 0.20 * heavyHiMidAnom);
+  } else {
+    freqScore = clamp01(0.65 * spectralRolloffAnom + 0.35 * spectralPeakAnom);
+  }
 
   // Branch B: Spatial / Sensor Noise & Kurtosis Branch
-  // FLUX has ultra-low smooth noise (< 9.5) + high kurtosis (> 40)
-  // SD1.5 / Degraded AI has depressed kurtosis (< 11) with elevated mid-band noise
-  const fluxSmoothSignal = sigmoid((9.8 - smoothNoise) * 0.65) * sigmoid((lapKurtosis - 22) * 0.14);
+  // Exclude JPEG-zeroed constant blocks (grad<2) under heavy JPEG or downsampled thumbnails
+  const effectiveSmooth = compressionMode === 'heavy_jpeg' || isSmallThumbnail ? nzSmoothNoise : smoothNoise;
+  const smoothThreshold = compressionMode === 'heavy_jpeg' ? 7.5 : isSmallThumbnail ? 6.0 : 9.8;
+  const smoothSlope = compressionMode === 'heavy_jpeg' ? 0.90 : 0.65;
+  const kurtThreshold = compressionMode === 'heavy_jpeg' ? 17.5 : 22.0;
+  const fluxSmoothSignal =
+    sigmoid((smoothThreshold - effectiveSmooth) * smoothSlope) * sigmoid((lapKurtosis - kurtThreshold) * 0.16);
   const depressedKurtSignal = sigmoid((10.5 - lapKurtosis) * 0.65) * sigmoid((smoothNoise - 10.5) * 0.45);
-  const spatialScore = clamp01(Math.max(fluxSmoothSignal, depressedKurtSignal * 0.92));
+  const graphicPortraitSmooth = isGraphicComposite
+    ? sigmoid((8.5 - smoothNoise) * 0.8) * sigmoid((lapKurtosis - 18.0) * 0.16)
+    : 0;
+  const spatialScore = clamp01(Math.max(fluxSmoothSignal, depressedKurtSignal * 0.92, graphicPortraitSmooth));
 
   // Branch C: Chrominance & Bayer Channel Coherence Branch
-  // Real camera Bayer demosaicing yields chroma/luma >= 0.145 & chromatic independence in at least one pair (min corr < 0.925)
-  // AI latent decoding yields suppressed chroma residual (0.035..0.157) & all RGB pairs tightly locked (>= 0.948)
   const meanChannelCorr = 0.5 * (corrRG + corrGB);
   const minChannelCorr = Math.min(corrRG, corrGB);
   const rawChromaRatioAnom = sigmoid((0.165 - chromaToLuma) * 26);
-  const rawChannelLockAnom = sigmoid((0.5 * (meanChannelCorr + minChannelCorr) - 0.94) * 42);
-  const chromaScore = isMonoOrLowSat
-    ? 0.45 // Neutralize chrominance cue on grayscale / low-saturation real photos
+  const lockMetric =
+    chromaToLuma >= 0.165 ? 0.3 * meanChannelCorr + 0.7 * minChannelCorr : 0.5 * (meanChannelCorr + minChannelCorr);
+  const rawChannelLockAnom = sigmoid((lockMetric - 0.942) * 42);
+  const chromaNeutralized = isMonoOrLowSat || isGraphicComposite;
+  const chromaScore = chromaNeutralized
+    ? 0.45 // Neutralize chrominance cue on monochrome or graphic-overlay composites
     : clamp01(0.60 * rawChromaRatioAnom + 0.40 * rawChannelLockAnom);
 
   // Quality-Aware CAGU Dynamic Weights
-  let rawW_Spatial = compressionMode === 'heavy_jpeg' ? 0.42 : 0.32;
-  let rawW_Freq = compressionMode === 'heavy_jpeg' ? 0.36 : 0.33;
-  let rawW_Chroma = isMonoOrLowSat ? 0.06 : compressionMode === 'heavy_jpeg' ? 0.22 : 0.35;
+  let rawW_Spatial = compressionMode === 'heavy_jpeg' ? 0.48 : 0.32;
+  let rawW_Freq = compressionMode === 'heavy_jpeg' ? 0.44 : 0.33;
+  let rawW_Chroma = chromaNeutralized ? 0.05 : compressionMode === 'heavy_jpeg' ? 0.08 : 0.35;
 
-  // If image is high-res (>= 900px, e.g., FLUX 1024x1024 or high-res camera), boost spatial+chroma precision
   if (Math.min(width, height) >= 900 && compressionMode === 'uncompressed') {
     rawW_Spatial = 0.36;
     rawW_Chroma = 0.42;
     rawW_Freq = 0.22;
+  } else if (isGraphicComposite) {
+    rawW_Spatial = 0.52;
+    rawW_Freq = 0.43;
+    rawW_Chroma = 0.05;
   }
 
   const wSum = rawW_Spatial + rawW_Freq + rawW_Chroma;
@@ -493,14 +567,20 @@ export function analyzeImagePixels(
   const fusedRaw = wSpatial * spatialScore + wFreq * freqScore + wChroma * chromaScore;
 
   // Dual-Domain Consistency Regularizer:
-  // Checks how many active branches agree (> 0.58) vs strongly oppose (< 0.35),
-  // plus optical Bayer chromatic independence check (real sensors break RGB lock in >=1 pair)
-  const activeSignals = [spatialScore, freqScore, ...(isMonoOrLowSat ? [] : [chromaScore])];
-  const highAgree = activeSignals.filter((s) => s > 0.58).length;
-  const lowAgree = activeSignals.filter((s) => s < 0.35).length;
+  // Under heavy_jpeg, JPEG 4:2:0 subsampling suppresses chroma on real photos -> only spatial+freq vote for highAgree
+  const activeForHigh =
+    compressionMode === 'heavy_jpeg' || chromaNeutralized
+      ? [spatialScore, freqScore]
+      : [spatialScore, freqScore, chromaScore];
+  const activeForLow = chromaNeutralized ? [spatialScore, freqScore] : [spatialScore, freqScore, chromaScore];
+  const highAgree = activeForHigh.filter((s) => s > 0.55).length;
+  const lowAgree = activeForLow.filter((s) => s < 0.35).length;
+
   const strongOpticalBayer =
-    !isMonoOrLowSat &&
+    !chromaNeutralized &&
     ((chromaScore < 0.18 && chromaToLuma > 0.20) || (minChannelCorr < 0.92 && chromaToLuma > 0.145));
+  const extremeLatentChromaStarvation =
+    !chromaNeutralized && compressionMode === 'uncompressed' && chromaToLuma < 0.06 && minChannelCorr > 0.99;
 
   let consistencyFactor = 1.0;
   let enhancedProbAi = fusedRaw;
@@ -510,6 +590,9 @@ export function analyzeImagePixels(
   } else if (highAgree >= 2) {
     consistencyFactor = 1.12;
     enhancedProbAi = clamp01(0.55 + (fusedRaw - 0.42) * 1.38);
+  } else if (extremeLatentChromaStarvation && freqScore > 0.35) {
+    consistencyFactor = 1.08;
+    enhancedProbAi = clamp01(0.58 + (fusedRaw - 0.40) * 1.25);
   } else if (lowAgree >= 2 && fusedRaw < 0.6) {
     consistencyFactor = 0.85;
     enhancedProbAi = clamp01(fusedRaw * 0.72);
@@ -528,8 +611,10 @@ export function analyzeImagePixels(
 
   let enhancedReasoning = '';
   if (enhancedProbAi >= 0.5) {
-    if (compressionMode === 'heavy_jpeg') {
-      enhancedReasoning = `CAGU phát hiện nén JPEG mạnh (blockiness=${jpegBlockiness.toFixed(2)}), tự động chuyển ${(wFreq * 100).toFixed(0)}% trọng số sang phổ tần số native + ${(wChroma * 100).toFixed(0)}% sang tương quan kênh màu và xác nhận ảnh AI.`;
+    if (isGraphicComposite) {
+      enhancedReasoning = `Phát hiện ảnh AI kết hợp chữ/đồ họa vector (mép chữ ${sharpEdgePct.toFixed(1)}%): CAGU cô lập nhiễu mép đồ họa ở kênh màu còn ${(wChroma * 100).toFixed(0)}% và xác nhận đặc trưng AI qua độ trơn nền & phổ 2D-FFT (${(wSpatial * 100).toFixed(0)}% + ${(wFreq * 100).toFixed(0)}%).`;
+    } else if (compressionMode === 'heavy_jpeg') {
+      enhancedReasoning = `CAGU phát hiện nén JPEG mạnh (blockiness=${jpegBlockiness.toFixed(2)}), hạ trọng số sắc độ 4:2:0 xuống ${(wChroma * 100).toFixed(0)}%, dồn ${(wSpatial * 100).toFixed(0)}% Không gian + ${(wFreq * 100).toFixed(0)}% phổ 2D-FFT đa vùng và xác nhận ảnh AI.`;
     } else if (fluxSmoothSignal > 0.6) {
       enhancedReasoning = `Vùng phẳng siêu mịn (smoothNoise=${smoothNoise.toFixed(1)}, kurtosis=${lapKurtosis.toFixed(1)}) kết hợp khóa kênh RGB (${(0.5 * (corrRG + corrGB)).toFixed(3)}) — dấu hiệu đặc trưng của Latent Diffusion / FLUX.`;
     } else {
@@ -538,6 +623,8 @@ export function analyzeImagePixels(
   } else {
     if (isMonoOrLowSat) {
       enhancedReasoning = `Ảnh có độ bão hòa thấp (${saturationMean.toFixed(2)}); CAGU tự động hạ trọng số kênh màu xuống ${(wChroma * 100).toFixed(1)}% để tránh báo nhầm, xác nhận nhiễu & phổ tự nhiên.`;
+    } else if (compressionMode === 'heavy_jpeg') {
+      enhancedReasoning = `Ảnh nén JPEG mạng xã hội (blockiness=${jpegBlockiness.toFixed(2)}): CAGU loại bỏ bội số lưới JPEG 8×8 & vùng phẳng bị lượng tử hóa (nzNoise=${nzSmoothNoise.toFixed(1)}), hạ kênh sắc độ 4:2:0 còn ${(wChroma * 100).toFixed(0)}% và xác nhận ảnh chụp tự nhiên.`;
     } else {
       enhancedReasoning = `Đồng thuận hai miền: tỷ lệ nhiễu sắc độ Chroma/Luma (${chromaToLuma.toFixed(3)}) và phổ năng lượng native (hi/mid=${nativeHighMidRatio.toFixed(2)}) phù hợp cảm biến quang học thực.`;
     }
@@ -563,6 +650,9 @@ export function analyzeImagePixels(
       corrRG,
       corrGB,
       smoothNoise,
+      nzSmoothNoise,
+      zeroGradPct,
+      sharpEdgePct,
       lapKurtosis,
       patchAnomalyCoveragePct,
     },
@@ -614,7 +704,7 @@ export function buildForensicLog(result: ForensicResult, threshold = 0.5): Foren
     title: `Van điều tiết CAGU (Nén JPEG blockiness = ${features.jpegBlockiness.toFixed(2)})`,
     detail:
       cagu.compressionMode === 'heavy_jpeg'
-        ? `Phát hiện nén JPEG nặng (>1.22): CAGU giảm nhánh pixel còn ${cagu.spatialPct.toFixed(1)}%, tăng Tần số (${cagu.freqPct.toFixed(1)}%) & Kênh màu (${cagu.chromaPct.toFixed(1)}%).`
+        ? `Phát hiện nén JPEG nặng (>1.22): CAGU phân bổ ${cagu.spatialPct.toFixed(1)}% Không gian (loại block lượng tử hóa) · ${cagu.freqPct.toFixed(1)}% Tần số đa vùng · hạ Kênh màu 4:2:0 còn ${cagu.chromaPct.toFixed(1)}%.`
         : `Ảnh ít/không nén JPEG: CAGU phân bổ ${cagu.spatialPct.toFixed(1)}% Không gian · ${cagu.freqPct.toFixed(1)}% Tần số · ${cagu.chromaPct.toFixed(1)}% Kênh màu.`,
     value: `${cagu.freqPct.toFixed(0)}% Freq`,
   });
@@ -622,21 +712,31 @@ export function buildForensicLog(result: ForensicResult, threshold = 0.5): Foren
   // 3. Native 2D-FFT Spectral Branch
   log.push({
     level: subScores.freqScore >= 0.55 ? 'critical' : 'ok',
-    title: `Phổ 2D-FFT Native (${result.nativeFftSize}×${result.nativeFftSize}): hi/mid = ${features.nativeHighMidRatio.toFixed(2)} · peak/med = ${features.nativePeakMedRatio.toFixed(2)}`,
+    title: `Phổ 2D-FFT Native đa vùng (${result.nativeFftSize}×${result.nativeFftSize}): hi/mid = ${features.nativeHighMidRatio.toFixed(2)} · peak/med = ${features.nativePeakMedRatio.toFixed(2)}`,
     detail:
       subScores.freqScore >= 0.55
         ? `Phổ dư khử nội dung suy giảm bất thường ở cao tần (hi/mid=${features.nativeHighMidRatio.toFixed(2)}) hoặc xuất hiện đỉnh chu kỳ (peak/med=${features.nativePeakMedRatio.toFixed(2)}).`
-        : `Phổ năng lượng 2D-FFT suy giảm tự nhiên theo quy luật 1/f của quang học thực tế.`,
+        : `Phổ năng lượng 2D-FFT đa vùng (đã lọc bội số lưới JPEG 8×8) suy giảm tự nhiên theo quy luật 1/f của quang học thực tế.`,
     value: `Score ${(subScores.freqScore * 100).toFixed(0)}%`,
   });
 
   // 4. Chrominance & Bayer Coherence
+  const isGraphicComp = features.zeroGradPct > 25 && features.sharpEdgePct > 3.5 && features.saturationMean > 0.25;
   log.push({
-    level: features.saturationMean < 0.09 ? 'info' : subScores.chromaScore >= 0.55 ? 'critical' : 'ok',
+    level:
+      features.saturationMean < 0.09 || isGraphicComp || cagu.compressionMode === 'heavy_jpeg'
+        ? 'info'
+        : subScores.chromaScore >= 0.55
+        ? 'critical'
+        : 'ok',
     title: `Tương quan Bayer RGB: Chroma/Luma = ${features.chromaToLuma.toFixed(3)} · corr(R,G) = ${features.corrRG.toFixed(3)}`,
     detail:
       features.saturationMean < 0.09
         ? `Ảnh đơn sắc / độ bão hòa thấp (${features.saturationMean.toFixed(2)}): nhánh sắc độ được tự động trung hòa để bảo toàn Specificity.`
+        : isGraphicComp
+        ? `Phát hiện chữ/đồ họa vector (mép sắc ${features.sharpEdgePct.toFixed(1)}%): nhánh sắc độ được cô lập để tránh nhiễu viền chữ làm sai lệch Bayer.`
+        : cagu.compressionMode === 'heavy_jpeg'
+        ? `Nén JPEG 4:2:0 làm suy hao kênh màu Cb/Cr (Chroma/Luma=${features.chromaToLuma.toFixed(3)}): CAGU không dùng tín hiệu này làm bằng chứng AI.`
         : subScores.chromaScore >= 0.55
         ? `Dư sắc độ Chroma/Luma thấp (${features.chromaToLuma.toFixed(3)}) và các kênh RGB khóa chặt (${features.corrRG.toFixed(3)}) — đặc trưng giải mã từ latent space.`
         : `Nhiễu sắc độ độc lập giữa các kênh RGB phù hợp cảm biến Bayer thực tế.`,
@@ -646,11 +746,11 @@ export function buildForensicLog(result: ForensicResult, threshold = 0.5): Foren
   // 5. Spatial Sensor Noise & Kurtosis
   log.push({
     level: subScores.spatialScore >= 0.55 ? 'critical' : 'ok',
-    title: `Nhiễu vùng phẳng & Kurtosis: smoothNoise = ${features.smoothNoise.toFixed(1)} · Kurtosis = ${features.lapKurtosis.toFixed(1)}`,
+    title: `Nhiễu vùng phẳng & Kurtosis: nzNoise = ${features.nzSmoothNoise.toFixed(1)} · Kurtosis = ${features.lapKurtosis.toFixed(1)}`,
     detail:
       subScores.spatialScore >= 0.55
-        ? `Phân bố sai phân Laplacian bất thường (smoothNoise=${features.smoothNoise.toFixed(1)}, kurtosis=${features.lapKurtosis.toFixed(1)}, vùng nghi vấn ${features.patchAnomalyCoveragePct.toFixed(1)}%).`
-        : `Độ nhọn và nhiễu nền vùng phẳng nằm trong biên độ tự nhiên của ống kính & cảm biến.`,
+        ? `Phân bố sai phân Laplacian bất thường (smoothNoise=${features.smoothNoise.toFixed(1)}, nzNoise=${features.nzSmoothNoise.toFixed(1)}, kurtosis=${features.lapKurtosis.toFixed(1)}).`
+        : `Độ nhọn và nhiễu nền (nzNoise=${features.nzSmoothNoise.toFixed(1)}, đã loại vùng lượng tử hóa) nằm trong biên độ tự nhiên của ống kính & cảm biến.`,
     value: `Score ${(subScores.spatialScore * 100).toFixed(0)}%`,
   });
 

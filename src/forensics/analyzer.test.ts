@@ -109,4 +109,90 @@ test('Baseline vs Enhanced v2 evaluation across all 29 real dataset images', () 
     enhMetrics.aucRoc > baseMetrics.aucRoc,
     `Expected Enhanced v2 AUC (${enhMetrics.aucRoc}) to exceed Baseline (${baseMetrics.aucRoc})`
   );
+  assert.equal(enhMetrics.accuracy, 100, `Expected 100% accuracy on 29 dataset images, got ${enhMetrics.accuracy}%`);
+  assert.equal(enhMetrics.aucRoc, 1, `Expected AUC=1.0 on 29 dataset images, got ${enhMetrics.aucRoc}`);
 });
+
+test('Real-world Facebook heavy JPEGs vs AI+graphic poster composites', () => {
+  const userCases: { file: string; label: 0 | 1; desc: string }[] = [
+    {
+      file: 'public/assets/aistudio/914890198_1372191811507318_1264390257786523529_n_b6820a90.jpg',
+      label: 0,
+      desc: 'USER_REAL_1_dinh (1920x1440 Facebook JPEG)',
+    },
+    {
+      file: 'public/assets/aistudio/912518870_960026286947609_4330364491680889669_n_d4862701.jpg',
+      label: 0,
+      desc: 'USER_REAL_2_dinh (1920x1440 Facebook JPEG with architectural louvers)',
+    },
+    {
+      file: 'public/assets/aistudio/910494638_1882733106213036_4003375243922980008_n_31765791.jpg',
+      label: 1,
+      desc: 'USER_AI_ZALO_AD (926x540 AI girl + vector text composite)',
+    },
+  ];
+
+  for (const item of userCases) {
+    const absPath = path.resolve(process.cwd(), item.file);
+    const { rgba, width, height } = decodeImageRgbaViaFfmpeg(absPath);
+    const res = analyzeImagePixels(rgba, width, height);
+    console.log(
+      `USER_CASE | ${item.desc} | enh=${(res.enhancedProbAi * 100).toFixed(1)}% | cagu=${res.cagu.compressionMode} | blk=${res.features.jpegBlockiness.toFixed(2)} | peak=${res.features.nativePeakMedRatio.toFixed(2)}`
+    );
+    if (item.label === 0) {
+      assert.ok(res.enhancedProbAi < 0.5, `Expected REAL (<0.5) for ${item.desc}, got ${res.enhancedProbAi}`);
+    } else {
+      assert.ok(res.enhancedProbAi >= 0.5, `Expected AI (>=0.5) for ${item.desc}, got ${res.enhancedProbAi}`);
+    }
+  }
+
+  // Simulate extreme 590x365 low-bitrate (~15KB) Facebook JPEG over a real photo
+  const simOut = '/tmp/cagu_sim_fb_590x365.jpg';
+  execFileSync('ffmpeg', [
+    '-y',
+    '-v',
+    'error',
+    '-i',
+    path.resolve(process.cwd(), 'public/dataset/real/coco_000000039769.png'),
+    '-vf',
+    'scale=590:365:force_original_aspect_ratio=increase,crop=590:365',
+    '-q:v',
+    '22',
+    '-frames:v',
+    '1',
+    simOut,
+  ]);
+  const simDecoded = decodeImageRgbaViaFfmpeg(simOut);
+  const simRes = analyzeImagePixels(simDecoded.rgba, simDecoded.width, simDecoded.height);
+  console.log(
+    `SIM_FB_15KB | 590x365 q=22 | enh=${(simRes.enhancedProbAi * 100).toFixed(1)}% | mode=${simRes.cagu.compressionMode} | blk=${simRes.features.jpegBlockiness.toFixed(2)}`
+  );
+  assert.equal(simRes.cagu.compressionMode, 'heavy_jpeg');
+  assert.ok(simRes.enhancedProbAi < 0.5, `Expected REAL (<0.5) for 590x365 heavy JPEG, got ${simRes.enhancedProbAi}`);
+
+  // Simulate smooth blue conference wall + person silhouette 590x365 heavy JPEG (~15KB)
+  const studioOut = '/tmp/cagu_sim_fb_studio_590x365.jpg';
+  execFileSync('ffmpeg', [
+    '-y',
+    '-v',
+    'error',
+    '-f',
+    'lavfi',
+    '-i',
+    'color=c=#226688:s=590x365:d=1',
+    '-vf',
+    "drawbox=x=210:y=60:w=170:h=305:color=#1f2228:t=fill,drawbox=x=250:y=45:w=90:h=105:color=#c99476:t=fill,noise=alls=4:allf=t+u",
+    '-q:v',
+    '24',
+    '-frames:v',
+    '1',
+    studioOut,
+  ]);
+  const studioDecoded = decodeImageRgbaViaFfmpeg(studioOut);
+  const studioRes = analyzeImagePixels(studioDecoded.rgba, studioDecoded.width, studioDecoded.height);
+  console.log(
+    `SIM_FB_STUDIO | 590x365 q=24 | enh=${(studioRes.enhancedProbAi * 100).toFixed(1)}% | mode=${studioRes.cagu.compressionMode} | blk=${studioRes.features.jpegBlockiness.toFixed(2)}`
+  );
+  assert.ok(studioRes.enhancedProbAi < 0.5, `Expected REAL (<0.5) for 590x365 smooth studio JPEG, got ${studioRes.enhancedProbAi}`);
+});
+
