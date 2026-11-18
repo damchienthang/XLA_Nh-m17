@@ -151,8 +151,8 @@ def _build_analysis_log(res: dict, threshold: float = 0.5) -> list:
                 "icon": "▲" if mode == "heavy_jpeg" else "●",
                 "title": f"Van điều tiết CAGU (JPEG Blockiness = {blk:.2f})",
                 "detail": (
-                    f"Phát hiện nén JPEG nặng (>1.22): CAGU phân bổ {sp_pct:.1f}% Không gian (loại block lượng tử hóa) · "
-                    f"{fr_pct:.1f}% Tần số đa vùng · hạ Kênh màu 4:2:0 còn {ch_pct:.1f}%."
+                    f"Phát hiện nén JPEG nặng (>1.22): CAGU điều phối {sp_pct:.1f}% Không gian · "
+                    f"{fr_pct:.1f}% Tần số · {ch_pct:.1f}% Kênh màu."
                     if mode == "heavy_jpeg"
                     else f"Ảnh ít/không nén JPEG: CAGU phân bổ {sp_pct:.1f}% Không gian · "
                     f"{fr_pct:.1f}% Tần số · {ch_pct:.1f}% Kênh màu."
@@ -170,12 +170,12 @@ def _build_analysis_log(res: dict, threshold: float = 0.5) -> list:
             {
                 "level": "critical" if fr_score >= 0.55 else "ok",
                 "icon": "✖" if fr_score >= 0.55 else "●",
-                "title": f"Phổ 2D-FFT Native đa vùng ({fft_sz}×{fft_sz}): hi/mid = {hi_mid:.2f} · peak/med = {peak_med:.2f}",
+                "title": f"Phổ 2D-FFT Native ({fft_sz}×{fft_sz}): hi/mid = {hi_mid:.2f} · peak/med = {peak_med:.2f}",
                 "detail": (
                     f"Phổ dư khử nội dung suy giảm bất thường ở cao tần (hi/mid={hi_mid:.2f}) "
                     f"hoặc xuất hiện đỉnh chu kỳ (peak/med={peak_med:.2f})."
                     if fr_score >= 0.55
-                    else "Phổ năng lượng 2D-FFT đa vùng (đã lọc bội số lưới JPEG 8×8) suy giảm tự nhiên theo quy luật 1/f của quang học."
+                    else "Phổ năng lượng 2D-FFT native suy giảm tự nhiên theo quy luật 1/f của quang học."
                 ),
                 "value": f"Score {fr_score * 100:.0f}%",
             }
@@ -184,20 +184,10 @@ def _build_analysis_log(res: dict, threshold: float = 0.5) -> list:
         chr_lum = float(native_feat.get("chroma_to_luma", 0.2))
         min_corr = float(native_feat.get("min_channel_corr", 0.9))
         sat = float(native_feat.get("saturation_mean", 0.2))
-        z_pct = float(native_feat.get("zero_grad_pct", 0.0))
-        sh_pct = float(native_feat.get("sharp_edge_pct", 0.0))
-        is_graphic_comp = z_pct > 25.0 and sh_pct > 3.5 and sat > 0.25
         ch_score = float(sub.get("chroma_score", 0.0))
-        mode = cagu_w.get("compression_mode", "uncompressed") if cagu_w else "uncompressed"
         if sat < 0.09:
             ch_level, ch_icon = "info", "◆"
             ch_detail = f"Ảnh đơn sắc / độ bão hòa thấp ({sat:.2f}): nhánh sắc độ được trung hòa tự động."
-        elif is_graphic_comp:
-            ch_level, ch_icon = "info", "◆"
-            ch_detail = f"Phát hiện chữ/đồ họa vector (mép sắc {sh_pct:.1f}%): nhánh sắc độ được cô lập để tránh nhiễu viền chữ làm sai lệch Bayer."
-        elif mode == "heavy_jpeg":
-            ch_level, ch_icon = "info", "◆"
-            ch_detail = f"Nén JPEG 4:2:0 làm suy hao kênh màu Cb/Cr (Chroma/Luma={chr_lum:.3f}): CAGU không dùng tín hiệu này làm bằng chứng AI."
         elif ch_score >= 0.55:
             ch_level, ch_icon = "critical", "✖"
             ch_detail = (
@@ -218,18 +208,17 @@ def _build_analysis_log(res: dict, threshold: float = 0.5) -> list:
         )
 
         sm_noise = float(native_feat.get("smooth_noise", 12.0))
-        nz_sm_noise = float(native_feat.get("nz_smooth_noise", sm_noise))
         kurt = float(native_feat.get("lap_kurtosis", 15.0))
         sp_score = float(sub.get("spatial_score", 0.0))
         log.append(
             {
                 "level": "critical" if sp_score >= 0.55 else "ok",
                 "icon": "✖" if sp_score >= 0.55 else "●",
-                "title": f"Nhiễu vùng phẳng & Kurtosis: nzNoise = {nz_sm_noise:.1f} · Kurtosis = {kurt:.1f}",
+                "title": f"Nhiễu vùng phẳng & Kurtosis: smoothNoise = {sm_noise:.1f} · Kurtosis = {kurt:.1f}",
                 "detail": (
-                    f"Phân bố sai phân Laplacian bất thường (smoothNoise={sm_noise:.1f}, nzNoise={nz_sm_noise:.1f}, kurtosis={kurt:.1f})."
+                    f"Phân bố sai phân Laplacian bất thường (smoothNoise={sm_noise:.1f}, kurtosis={kurt:.1f})."
                     if sp_score >= 0.55
-                    else f"Độ nhọn và nhiễu nền (nzNoise={nz_sm_noise:.1f}, đã loại vùng lượng tử hóa) nằm trong biên độ tự nhiên của ống kính & cảm biến."
+                    else f"Độ nhọn và nhiễu nền (smoothNoise={sm_noise:.1f}) nằm trong biên độ tự nhiên của ống kính & cảm biến."
                 ),
                 "value": f"Score {sp_score * 100:.0f}%",
             }
